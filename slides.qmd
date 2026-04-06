@@ -1,0 +1,230 @@
+---
+title: "Automating iLand on HPC"
+subtitle: "From hard-coded scripts to parallel, replicated scenario runs"
+author: "Quinn Asena · CPCRW iLand project"
+format:
+  revealjs:
+    theme: dark
+    highlight-style: monokai
+    slide-number: c/t
+    transition: slide
+    background-transition: fade
+    code-block-height: 520px
+    smaller: true
+---
+## The starting point
+Two files drove the workflow — both full of hard-coded paths:
+::: {.columns}
+::: {.column width="50%"}
+**JavaScript file** `afterFireProcessing()`
+```javascript
+Fire.gridToFile(
+  'crownkill',
+  '/glade/derecho/scratch/hayesk/output/' +
+  'CPCRW_nofecund/crownkill/crownkill_'
+  + pid + '_' + praefix + '.txt'
+);
+```
+:::
+::: {.column width="50%"}
+**Bash script** `run_iland_replicates.sh`
+```bash
+/glade/work/hayesk/iLand2.0/iland-model/ \
+  build/ilandc/ilandc \
+  /glade/work/hayesk/CPCRW_fecund/$dirname.xml \
+  $years …
+mkdir /glade/derecho/scratch/hayesk/ \
+  output/${dirname}/crownkill_$dirname.$rep
+```
+:::
+:::
+. . .
+::: {.callout-warning}
+A new project file needed a new `.js` file, new paths everywhere, and running
+in parallel caused **race conditions**.
+:::
+---
+## Step 1 — Remove hard-coding from `afterFireProcessing()`
+Replace the literal path with iLand's own settings API:
+::: {.columns}
+::: {.column width="50%"}
+❌ Before
+```javascript
+function afterFireProcessing() {
+  var praefix = Globals.year;
+  var pid = Fire.id;
+  Fire.gridToFile(
+    'crownkill',
+    '/glade/derecho/scratch/hayesk/output/' +
+    'CPCRW_nofecund/crownkill/crownkill_'
+    + pid + '_' + praefix + '.txt'
+  );
+}
+```
+:::
+::: {.column width="50%"}
+✅ After
+```javascript
+function afterFireProcessing() {
+  var outputPath = Globals.path(
+    Globals.setting('system.path.output')
+  );
+  var praefix = Globals.year;
+  var pid = Fire.id;
+  Fire.gridToFile(
+    'crownkill',
+    outputPath + '/crownkill/crownkill_'
+    + pid + '_' + praefix + '.txt'
+  );
+}
+```
+:::
+:::
+. . .
+::: {.callout-note}
+One `.js` file now works for *any* project — the path comes from the XML at
+runtime via `Globals.setting('system.path.output')`.
+:::
+---
+## Step 2 — CSV-based scenario & replicate approach
+Define every scenario combination once in a CSV:
+```csv
+fecund,gcm,fri,epsilon,dbh,id
+species_param_pa01pl035be05pr07,NorEsm2-MMssp126V3,120,2.7,2.5,filt_1980
+```
+. . .
+The bash script reads it line by line:
+```bash
+# call: bash run_iland.sh project.xml 1 5
+xml=$1
+start_rep=$2
+end_rep=$3
+csv_name="iland_reps.csv"
+sed 1d "$csv_name" | while IFS=, read -r fecund gcm fri epsilon dbh id
+do
+    for rep in $(seq "$start_rep" "$end_rep")
+    do
+        echo "running gcm $gcm fecund $fecund rep $rep"
+        # … scenario logic …
+    done
+done
+```
+. . .
+::: {.callout-tip}
+Adding a new scenario = adding one row to the CSV. No script edits needed.
+:::
+---
+## Step 3 — Create directory structure in the bash script
+Each replicate gets its own isolated output tree:
+```bash
+scenario_dir="${output_path}/${gcm}_${fecund}_ep${epsilon}_dbh${dbh}_${id}/rep_${rep}"
+mkdir -p "${scenario_dir}/crownkill"   # fire crown-kill grids  (.txt)
+mkdir -p "${scenario_dir}/nFire"       # fire count grids       (.asc)
+mkdir -p "${scenario_dir}/log"         # iLand log files
+```
+. . .
+::: {.callout-note}
+`mkdir -p` creates the full path and is silent if it already exists —
+safe to call inside nested loops.
+:::
+. . .
+::: {.callout-tip}
+Outputs for every scenario × replicate combination land in their own folder,
+never mixed together.
+:::
+---
+## Step 4 — Remove hard-coded bash dependencies
+All site-specific paths live as variables at the top of the script:
+```bash
+# ── configure these for your HPC environment ──────────────
+path="/glade/work/qasena/iLand2.0/iland-model/build/ilandc/ilandc"
+output_path="/glade/derecho/scratch/qasena/output_auto/CPCRW_hist_spinup"
+xml_path="/glade/work/qasena/iLand_automated"
+simulation_years="300"
+csv_name="/glade/work/qasena/iLand_automated/iland_reps.csv"
+# ──────────────────────────────────────────────────────────
+```
+. . .
+iLand is then called with fully-expanded variables:
+```bash
+"${path}" "$tmp_xml" "$simulation_years" \
+    system.database.out=${gcm}_${fecund}_${rep}.sqlite \
+    system.database.climate=${gcm}.sqlite \
+    system.database.in=${fecund}.sqlite \
+    system.logging.logFile=${scenario_dir}/log/log_${gcm}_${fecund}_${rep}.txt \
+    modules.fire.fireReturnInterval=${fri} \
+    model.settings.epsilon=${epsilon} \
+    output.saplingdetail.minDbh=${dbh}
+```
+---
+## Step 5 — Redirecting iLand's internal output to scratch
+iLand resolves all output paths relative to the `<output>` tag in its project
+XML. On HPC, outputs *must* land on a fast scratch filesystem, not on the work
+filesystem where the XML lives.
+```xml
+<!-- default — output stays next to the project file -->
+<output>output</output>
+<!-- what we need — an absolute scratch path per replicate -->
+<output>/glade/derecho/scratch/qasena/output_auto/…/rep_1</output>
+```
+. . .
+::: {.callout-note}
+Overriding this tag is what allows the `.js` file to resolve
+`Globals.setting('system.path.output')` to the right scratch directory at
+runtime — without touching the `.js` file at all.
+:::
+---
+## The race condition problem
+First attempt: let all replicates write to a *shared* crownkill directory,
+then `cp`/`rm` into per-replicate folders.
+```bash
+# ❌ Original approach — breaks with parallel instances
+"${path}" ${xml} $years \
+    system.database.out=output_${rep}.sqlite …
+cp -r ${output_path}/crownkill/* \
+      ${scenario_dir}/crownkill_${gcm}_${fecund}_${rep}/
+rm    ${output_path}/crownkill/*
+```
+. . .
+::: {.callout-warning}
+When multiple iLand instances run simultaneously they all write fire grids to
+the **same** `crownkill/` directory. The `cp` of rep 1 can pick up files from
+rep 2, and the `rm` can delete files that rep 3 hasn't copied yet.
+:::
+. . .
+→ Files from different replicates get mixed together or lost entirely.
+---
+## Final solution — copy XML & overwrite `<output>`
+Give each replicate its *own temporary XML* pointing to its own output directory:
+```bash
+scenario_dir="${output_path}/${gcm}_${fecund}_ep${epsilon}_dbh${dbh}_${id}/rep_${rep}"
+tmp_xml="${xml_path}/${gcm}_${fecund}_ep${epsilon}_dbh${dbh}_${id}_${rep}.xml"
+# 1. copy the base project XML
+cp "$xml" "$tmp_xml"
+# 2. rewrite the <output> tag to an absolute, replicate-specific path
+sed -i "s|<output>.*</output>|<output>${scenario_dir}</output>|" "$tmp_xml"
+# 3. run iLand with the patched XML
+"${path}" "$tmp_xml" "$simulation_years" …
+# 4. clean up the temporary XML
+rm "$tmp_xml"
+```
+. . .
+::: {.callout-tip}
+✅ Each iLand instance writes its fire grids directly to its own
+`scenario_dir/crownkill/` — no shared directory, no race conditions.
+:::
+---
+## Summary
+| Problem | Solution |
+|---|---|
+| Hard-coded paths in `.js` file | Read output path from `Globals.setting('system.path.output')` |
+| Hard-coded paths in bash script | Variables declared at the top; passed via CSV columns |
+| One bash call per project file | CSV-driven loop — add a row, not a script |
+| Directory creation was manual | `mkdir -p` inside the replicate loop |
+| Race conditions (shared crownkill dir) | Per-replicate temporary XML with unique `<output>` path |
+| iLand output locked to work filesystem | `sed` rewrites `<output>` to absolute scratch path |
+. . .
+::: {.callout-tip}
+Result: fully parallel, replicated scenario runs with zero shared state between
+instances — on any HPC with a scratch filesystem.
+:::
