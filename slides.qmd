@@ -48,13 +48,15 @@ Not necessary if you do not have a JavaScript dependency or if you can run repli
 
 ---
 
-## This hurt
+## This hurt...
 
 ![](/images/github.png){fig-align="center"}
 
 ---
 
 ## Original JavaScript
+
+_The origin of all evil lies here._
 
 **JavaScript file**
 
@@ -67,7 +69,7 @@ function afterFireProcessing() {
    // save a file for each fire
    Fire.gridToFile(
      'crownkill',
-     '/glade/derecho/scratch/asenaq/output/CPCRW_nofecund/crownkill/crownkill_'
+     '/glade/derecho/scratch/user/output/CPCRW_nofecund/crownkill/crownkill_'
      + pid + '_' + praefix + '.txt'
    );
 }
@@ -86,7 +88,7 @@ function afterFireProcessing() {
 
 ## Original bash script
 
-**Bash script** to run project file
+**Bash script** to run project file:
 
 ```bash
 reps=1
@@ -98,12 +100,12 @@ do
     dirname=$(basename $xml | cut -d"." -f 1)
     for rep in $(seq 1 $reps)
     do
-        /glade/work/asenaq/iLand2.0/iland-model/build/ilandc/ilandc \
-          /glade/work/asenaq/CPCRW_fecund/$dirname.xml $years \
+        /glade/work/user/iLand2.0/iland-model/build/ilandc/ilandc \
+          /glade/work/user/CPCRW_fecund/$dirname.xml $years \
           system.database.out=${dirname}_$rep.sqlite
-        cp -r /glade/derecho/scratch/asenaq/output/${dirname}/crownkill/* \
-          /glade/derecho/scratch/asenaq/output/${dirname}/crownkill_$dirname.$rep/
-        rm /glade/derecho/scratch/asenaq/output/${dirname}/crownkill/*
+        cp -r /glade/derecho/scratch/user/output/${dirname}/crownkill/* \
+          /glade/derecho/scratch/user/output/${dirname}/crownkill_$dirname.$rep/
+        rm /glade/derecho/scratch/user/output/${dirname}/crownkill/*
     done
 done
 ```
@@ -114,19 +116,12 @@ done
 to run different scenarios required duplicating the project file, the .js file, correcting the pathway references, and manually creating an output directory sctructure.
 :::
 
-First task was to remove the hard-coded pathways from the JavaScript file so that it references the project file.
 
 ---
 
-## Remove hard-coding from `afterFireProcessing()`
+## Remove hard-coding from JavaScript
 
-Replace the literal path with iLand's internal referencing structure:
-
-::: {.columns}
-
-::: {.column width="50%"}
-
-Before
+**Before**
 
 ```javascript
 function afterFireProcessing() {
@@ -135,17 +130,13 @@ function afterFireProcessing() {
    var nFire = Fire.grid('nFire');
    Fire.gridToFile(
      'crownkill',
-     '/glade/derecho/scratch/asenaq/output/CPCRW_nofecund/crownkill/crownkill_'
+     '/glade/derecho/scratch/user/output/CPCRW_nofecund/crownkill/crownkill_'
      + pid + '_' + praefix + '.txt'
    );
 }
 ```
 
-:::
-
-::: {.column width="50%"}
-
-After
+**After**
 
 ```javascript
 function afterFireProcessing() {
@@ -164,24 +155,50 @@ function afterFireProcessing() {
 }
 ```
 
-:::
+---
 
-:::
+`Globals.setting('system.path.output')` reflects tags in the project file.
 
+JavaScript:
+
+```javascript
+function afterFireProcessing() {
+   var outputPath = Globals.path(
+     Globals.setting('system.path.output')
+   );
+   ...
+}
+```
+
+Project xml:
+
+```xml
+<project>
+  <system>
+    <path>
+     ...
+	  <output>/glade/derecho/scratch/qasena/output_auto/CPCRW_hist</output>
+    </path>
+     ...
+
+```
 ---
 
 ## CSV-based replicates & scenarios
 
 The CSV looks like this — one row per scenario:
 
+<br>
+
 | fecund | gcm | fri | epsilon | dbh | id |
 |---|---|---|---|---|---|
 | sp_param | NorEsm-MMssp126 | 120 | 2.7 | 2.5 | filt_1980 |
 | sp_param | TaiEsm-MMssp126 | 120 | 2.7 | 2.5 | filt_1980 |
 
-- The `reps` argument can be in the CSV or the bash script.
+<br>
 
 ::: {.callout-note}
+# CSV scenario management documented in iLand book
 Approach adapted from the [iLand book](https://iland-model.org/iland-book/Managing_simulation_experiments.html) — note there are a few bugs in the examples there.
 :::
 
@@ -205,9 +222,9 @@ If a CSV value is missing or mis-spelled, iLand will fail to find the file and e
 
 ---
 
-## New bash script — v1
+## New bash script
 
-The script reads the CSV line by line and creates subdirectories like `crownkill/` to save fire outputs:
+The script reads the CSV line by line and creates subdirectories like `crownkill/` to save fire outputs, and cleans up after itself:
 
 ```bash
 set -e           # terminate if non-zero exit
@@ -278,7 +295,7 @@ done
 
 ## The race condition problem
 
-This approach seemed reasonable — write outputs to a shared directory, then move them. But running replicates in parallel means multiple iLand instances share the same `crownkill/` folder simultaneously.
+This approach worked in serial during local testing. But running replicates in parallel means multiple iLand instances share the same `crownkill/` folder simultaneously.
 
 ```bash
 # ❌ v1 approach — breaks with parallel instances
@@ -292,6 +309,7 @@ rm    ${output_path}/crownkill/*
 . . .
 
 ::: {.callout-warning}
+# Race conditions
 When multiple iLand instances run simultaneously they all write fire grids to
 the **same** `crownkill/` directory. The `cp` of rep 1 can pick up files from
 rep 2, and the `rm` can delete files that rep 3 hasn't copied yet.
@@ -299,25 +317,66 @@ rep 2, and the `rm` can delete files that rep 3 hasn't copied yet.
 
 ---
 
-##
+::: {.columns}
+
+::: {.column width="50%"}
 
 [:sob:]{style="font-size:4em;"}
 
-. . .
+[:sob:]{.fragment style="font-size:8em;"}
 
-[:sob:]{style="font-size:8em;"}
+[:sob:]{.fragment style="font-size:10em;"}
 
-. . .
+:::
 
-[:sob:]{style="font-size:12em;"}
+::: {.column width="50%"}
+
+::: {style="text-align: right;"}
+
+[:sob:]{.fragment style="font-size:7em;"}
+
+[:sob:]{.fragment style="font-size:9em;"}
+
+[:sob:]{.fragment style="font-size:11em;"}
+
+:::
+
+:::
+
+:::
 
 ---
 
-## Final solution — per-replicate XML
+I tried to overwrite the `<output>` tag with variations on: `system.path.output`. To no avail, iLand's internal path resolution doesn't seem to allow this tag to be overridden at runtime? **Kristin!! Help!!**
+
+```xml
+<project>
+  <system>
+    <path>
+      <home></home>
+      <database>databases</database>
+	    <temp>temp</temp>
+      <lip>lip</lip>
+      <script>scripts</script>
+	    <init>init</init>
+>>>>>><output>/glade/derecho/scratch/qasena/output_auto/CPCRW_hist</output>
+    </path>
+      ...
+```
+
+. . .
+
+I've gone and made the JavaScript file to resolve to `<output>` so that I don't need to uplicate the file for each scenario!
+
+---
+
+
+## Final solution: per-replicate XML
 
 The fix: give each replicate its *own temporary XML* with its output path baked in.
 
 ::: {.callout-note}
+# This was written by AI, I think it's correct:
 iLand resolves all output paths relative to the `<output>` tag in the project XML. By overriding it per-replicate, the `.js` file's `Globals.setting('system.path.output')` resolves to the correct scratch directory — with no shared state between instances.
 :::
 
@@ -337,12 +396,13 @@ rm "$tmp_xml"
 . . .
 
 ::: {.callout-tip}
+# Now
 Each iLand instance writes fire grids directly to its own `scenario_dir/crownkill/` — no shared directory, no race conditions.
 :::
 
 ---
 
-## Complete script — setup
+## Complete script: setup
 
 ```bash
 set -e           # terminate if non-zero exit
@@ -366,7 +426,7 @@ mkdir -p "${output_path}"
 
 ---
 
-## Complete script — loop & directories
+## Complete script: loop & directories
 
 ```bash
 # Read CSV (skip header) and loop through scenarios × replicates
@@ -390,7 +450,7 @@ do
 
 ---
 
-## Complete script — run & cleanup
+## Complete script: run & cleanup
 
 ```bash
         # Run iLand model
@@ -416,30 +476,42 @@ done
 | Problem | Solution |
 |---|---|
 | Hard-coded paths in `.js` file | Read output path from `Globals.setting('system.path.output')` |
-| Hard-coded paths in bash script | Variables declared at the top; passed via CSV columns |
-| One project file per scenario | CSV-driven loop — add a row, not a script |
+| Hard-coded  output paths in bash script | Relative to project root |
+| One xml and JavaScript per scenario | CSV-based scenarios |
 | Directory creation was manual | `mkdir -p` inside the replicate loop |
 | Race conditions (shared crownkill dir) | Per-replicate temporary XML with unique `<output>` path |
 
+. . .
+
+::: {.callout-warning}
+# Did I spend a lot of time being stupid?
+Was there a better way to do all this to begin with?
+:::
 
 ## Communing with Derecho
 
-- Git version control for scripts, CSV, and project files
-- model tracking csv
+- Git version control for all scripts, CSV, and project files
+- Include a model tracking csv:
+
+<br>
 
 ::: {style="font-size:0.55em;"}
 
 | date_run_ymd | job_id | success | time_taken_h:m | walltime_reqested_h | param_notes | git_head |
 |---|---|---|---|---|---|---|
-| 20260224 | 2532378 | TRUE | 4.6 | 24 | Saving yr > 260 | 1e3d9e8 |
+| 20260224 | 2532399 | TRUE | 4.6 | 24 | Saving yr > 260 | 1e3d9e8 |
 | 20260224 | 2532378 | TRUE | 4.57 | 24 | Saving yr > 260 | 1e3d9e8 |
 
 :::
 
-::: {.callout-note}
-Full CSV also tracks `temporal_extent_yr`, `rep`, `threads`, `mem_used`, and `output_filesize`.
-:::
+<br>
 
-I edit the scenario csv or project file, push to git, pull to Derecho, and record the git head and jobid for every run in my model tracking csv.
+- I edit the scenario csv or project file -> `git push` to cloud -> `git pull` to Derecho -> record the git head (`git show HEAD`) -> submit the job, and record the jobid for every submission in my model tracking csv.
 
-This way I can easily trace back from an output to the exact code and parameters that generated it.
+- This way I can easily trace back from an output to the exact code and parameters that generated it.
+
+## Next?
+
+- Questions and comments on the approach?
+- Workflow for initialising multiple landscapes in Alaska?
+- Containerization?
