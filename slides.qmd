@@ -513,5 +513,15 @@ Was there a better way to do all this to begin with?
 ## Next?
 
 - Questions and comments on the approach?
-- Workflow for initialising multiple landscapes in Alaska?
 - Containerization?
+- Workflow for initialising multiple landscapes in Alaska?
+
+::: {.callout-note}
+# Scripts in GitHub repo!
+I've included the scenario csv, bash script, JavaScript file, and XML in [iLand-NA-parallel repo](https://github.com/QuinnAsena/iLand-NA-parallel).
+
+- If you want to use them or suggest improvements, please open a PR!
+
+- I'm transferring the inherited xml file to the maximilist project file.
+
+:::
