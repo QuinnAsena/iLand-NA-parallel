@@ -417,41 +417,37 @@
 <section id="new-bash-script" class="slide level2">
 <h2>New bash script</h2>
 <p>The script reads the CSV line by line and creates subdirectories like <code>crownkill/</code> to save fire outputs, and cleans up after itself:</p>
-<div class="sourceCode" id="cb9"><pre class="sourceCode numberSource bash number-lines code-with-copy"><code class="sourceCode bash"><span id="cb9-1"><a href=""></a><span class="bu">set</span> <span class="at">-e</span>           <span class="co"># terminate if non-zero exit</span></span>
-<span id="cb9-2"><a href=""></a><span class="bu">set</span> <span class="at">-u</span>           <span class="co"># terminate if variable unset</span></span>
-<span id="cb9-3"><a href=""></a><span class="bu">set</span> <span class="at">-o</span> pipefail  <span class="co"># terminate if pipe command fails</span></span>
-<span id="cb9-4"><a href=""></a></span>
-<span id="cb9-5"><a href=""></a><span class="va">xml</span><span class="op">=</span><span class="va">$1</span>  <span class="va">start_rep</span><span class="op">=</span><span class="va">$2</span>  <span class="va">end_rep</span><span class="op">=</span><span class="va">$3</span></span>
-<span id="cb9-6"><a href=""></a></span>
-<span id="cb9-7"><a href=""></a><span class="va">path</span><span class="op">=</span><span class="st">"/glade/work/qasena/iLand2.0/iland-model/build/ilandc/ilandc"</span></span>
-<span id="cb9-8"><a href=""></a><span class="va">output_path</span><span class="op">=</span><span class="st">"/glade/derecho/scratch/qasena/output_auto/CPCRW_play"</span></span>
-<span id="cb9-9"><a href=""></a><span class="va">simulation_years</span><span class="op">=</span><span class="st">"5"</span></span>
-<span id="cb9-10"><a href=""></a><span class="va">csv_name</span><span class="op">=</span><span class="st">"/glade/work/qasena/iLand_automated/iland_reps.csv"</span></span>
-<span id="cb9-11"><a href=""></a></span>
-<span id="cb9-12"><a href=""></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">"</span><span class="va">${output_path}</span><span class="st">"</span></span>
-<span id="cb9-13"><a href=""></a></span>
-<span id="cb9-14"><a href=""></a><span class="fu">sed</span> 1d <span class="va">$csv_name</span> <span class="kw">|</span> <span class="cf">while</span> <span class="va">IFS</span><span class="op">=</span>, <span class="bu">read</span> <span class="at">-r</span> <span class="va">fecund</span> <span class="va">gcm</span> <span class="va">fri</span></span>
-<span id="cb9-15"><a href=""></a><span class="cf">do</span></span>
-<span id="cb9-16"><a href=""></a>    <span class="va">scenario_dir</span><span class="op">=</span><span class="st">"</span><span class="va">${output_path}</span><span class="st">/</span><span class="va">${gcm}</span><span class="st">_</span><span class="va">${fecund}</span><span class="st">"</span></span>
-<span id="cb9-17"><a href=""></a>    <span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">"</span><span class="va">$scenario_dir</span><span class="st">/log"</span></span>
-<span id="cb9-18"><a href=""></a></span>
-<span id="cb9-19"><a href=""></a>    <span class="cf">for</span> rep <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> <span class="va">$start_rep</span> <span class="va">$end_rep)</span></span>
-<span id="cb9-20"><a href=""></a>    <span class="cf">do</span></span>
-<span id="cb9-21"><a href=""></a>        <span class="fu">mkdir</span> <span class="at">-p</span> <span class="va">${scenario_dir}</span>/crownkill_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span></span>
-<span id="cb9-22"><a href=""></a>        <span class="st">"</span><span class="va">${path}</span><span class="st">"</span> <span class="va">${xml}</span> <span class="va">$simulation_years</span> <span class="dt">\</span></span>
-<span id="cb9-23"><a href=""></a>            system.database.out=<span class="va">${gcm}</span>_<span class="va">${fecund}</span>/output_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span>.sqlite <span class="dt">\</span></span>
-<span id="cb9-24"><a href=""></a>            system.database.climate=<span class="va">${gcm}</span>.sqlite <span class="dt">\</span></span>
-<span id="cb9-25"><a href=""></a>            system.database.in=<span class="va">${fecund}</span>.sqlite <span class="dt">\</span></span>
-<span id="cb9-26"><a href=""></a>            system.logging.logFile=<span class="va">${scenario_dir}</span>/log/log_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span>.txt <span class="dt">\</span></span>
-<span id="cb9-27"><a href=""></a>            modules.fire.fireReturnInterval=<span class="va">${fri}</span></span>
-<span id="cb9-28"><a href=""></a></span>
-<span id="cb9-29"><a href=""></a>        <span class="cf">if</span> <span class="bu">compgen</span> <span class="at">-G</span> <span class="st">"</span><span class="va">${output_path}</span><span class="st">/crownkill/*"</span> <span class="op">&gt;</span> /dev/null<span class="kw">;</span> <span class="cf">then</span></span>
-<span id="cb9-30"><a href=""></a>            <span class="fu">cp</span> <span class="at">-r</span> <span class="va">${output_path}</span>/crownkill/<span class="pp">*</span> <span class="dt">\</span></span>
-<span id="cb9-31"><a href=""></a>                  <span class="va">${scenario_dir}</span>/crownkill_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span></span>
-<span id="cb9-32"><a href=""></a>            <span class="fu">rm</span> <span class="va">${output_path}</span>/crownkill/<span class="pp">*</span></span>
-<span id="cb9-33"><a href=""></a>        <span class="cf">fi</span></span>
-<span id="cb9-34"><a href=""></a>    <span class="cf">done</span></span>
-<span id="cb9-35"><a href=""></a><span class="cf">done</span></span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+<div class="sourceCode" id="cb9"><pre class="sourceCode numberSource bash number-lines code-with-copy"><code class="sourceCode bash"><span id="cb9-1"><a href=""></a><span class="va">xml</span><span class="op">=</span><span class="va">$1</span>  <span class="va">start_rep</span><span class="op">=</span><span class="va">$2</span>  <span class="va">end_rep</span><span class="op">=</span><span class="va">$3</span></span>
+<span id="cb9-2"><a href=""></a></span>
+<span id="cb9-3"><a href=""></a><span class="va">path</span><span class="op">=</span><span class="st">"/glade/work/qasena/iLand2.0/iland-model/build/ilandc/ilandc"</span></span>
+<span id="cb9-4"><a href=""></a><span class="va">output_path</span><span class="op">=</span><span class="st">"/glade/derecho/scratch/qasena/output_auto/CPCRW_play"</span></span>
+<span id="cb9-5"><a href=""></a><span class="va">simulation_years</span><span class="op">=</span><span class="st">"5"</span></span>
+<span id="cb9-6"><a href=""></a><span class="va">csv_name</span><span class="op">=</span><span class="st">"/glade/work/qasena/iLand_automated/iland_reps.csv"</span></span>
+<span id="cb9-7"><a href=""></a></span>
+<span id="cb9-8"><a href=""></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">"</span><span class="va">${output_path}</span><span class="st">"</span></span>
+<span id="cb9-9"><a href=""></a></span>
+<span id="cb9-10"><a href=""></a><span class="fu">sed</span> 1d <span class="va">$csv_name</span> <span class="kw">|</span> <span class="cf">while</span> <span class="va">IFS</span><span class="op">=</span>, <span class="bu">read</span> <span class="at">-r</span> <span class="va">fecund</span> <span class="va">gcm</span> <span class="va">fri</span></span>
+<span id="cb9-11"><a href=""></a><span class="cf">do</span></span>
+<span id="cb9-12"><a href=""></a>    <span class="va">scenario_dir</span><span class="op">=</span><span class="st">"</span><span class="va">${output_path}</span><span class="st">/</span><span class="va">${gcm}</span><span class="st">_</span><span class="va">${fecund}</span><span class="st">"</span></span>
+<span id="cb9-13"><a href=""></a>    <span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">"</span><span class="va">$scenario_dir</span><span class="st">/log"</span></span>
+<span id="cb9-14"><a href=""></a></span>
+<span id="cb9-15"><a href=""></a>    <span class="cf">for</span> rep <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> <span class="va">$start_rep</span> <span class="va">$end_rep)</span></span>
+<span id="cb9-16"><a href=""></a>    <span class="cf">do</span></span>
+<span id="cb9-17"><a href=""></a>        <span class="fu">mkdir</span> <span class="at">-p</span> <span class="va">${scenario_dir}</span>/crownkill_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span></span>
+<span id="cb9-18"><a href=""></a>        <span class="st">"</span><span class="va">${path}</span><span class="st">"</span> <span class="va">${xml}</span> <span class="va">$simulation_years</span> <span class="dt">\</span></span>
+<span id="cb9-19"><a href=""></a>            system.database.out=<span class="va">${gcm}</span>_<span class="va">${fecund}</span>/output_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span>.sqlite <span class="dt">\</span></span>
+<span id="cb9-20"><a href=""></a>            system.database.climate=<span class="va">${gcm}</span>.sqlite <span class="dt">\</span></span>
+<span id="cb9-21"><a href=""></a>            system.database.in=<span class="va">${fecund}</span>.sqlite <span class="dt">\</span></span>
+<span id="cb9-22"><a href=""></a>            system.logging.logFile=<span class="va">${scenario_dir}</span>/log/log_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span>.txt <span class="dt">\</span></span>
+<span id="cb9-23"><a href=""></a>            modules.fire.fireReturnInterval=<span class="va">${fri}</span></span>
+<span id="cb9-24"><a href=""></a></span>
+<span id="cb9-25"><a href=""></a>        <span class="cf">if</span> <span class="bu">compgen</span> <span class="at">-G</span> <span class="st">"</span><span class="va">${output_path}</span><span class="st">/crownkill/*"</span> <span class="op">&gt;</span> /dev/null<span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb9-26"><a href=""></a>            <span class="fu">cp</span> <span class="at">-r</span> <span class="va">${output_path}</span>/crownkill/<span class="pp">*</span> <span class="dt">\</span></span>
+<span id="cb9-27"><a href=""></a>                  <span class="va">${scenario_dir}</span>/crownkill_<span class="va">${gcm}</span>_<span class="va">${fecund}</span>_<span class="va">${rep}</span></span>
+<span id="cb9-28"><a href=""></a>            <span class="fu">rm</span> <span class="va">${output_path}</span>/crownkill/<span class="pp">*</span></span>
+<span id="cb9-29"><a href=""></a>        <span class="cf">fi</span></span>
+<span id="cb9-30"><a href=""></a>    <span class="cf">done</span></span>
+<span id="cb9-31"><a href=""></a><span class="cf">done</span></span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </section>
 <section id="section" class="slide level2 big-text">
 <h2></h2>
@@ -727,7 +723,7 @@
 <td>4.57</td>
 <td>24</td>
 <td>Saving yr &gt; 260</td>
-<td>1e3d9e8</td>
+<td>1e4e7d9</td>
 </tr>
 </tbody>
 </table>
