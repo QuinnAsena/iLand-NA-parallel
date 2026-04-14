@@ -227,10 +227,6 @@ If a CSV value is missing or mis-spelled, iLand will fail to find the file and e
 The script reads the CSV line by line and creates subdirectories like `crownkill/` to save fire outputs, and cleans up after itself:
 
 ```bash
-set -e           # terminate if non-zero exit
-set -u           # terminate if variable unset
-set -o pipefail  # terminate if pipe command fails
-
 xml=$1  start_rep=$2  end_rep=$3
 
 path="/glade/work/qasena/iLand2.0/iland-model/build/ilandc/ilandc"
@@ -366,7 +362,7 @@ I tried to overwrite the `<output>` tag with variations on: `system.path.output`
 
 . . .
 
-I've gone and made the JavaScript file to resolve to `<output>` so that I don't need to uplicate the file for each scenario!
+I've gone and made the JavaScript file to resolve to `<output>` so that I don't need to duplicate the file for each scenario!
 
 ---
 
@@ -500,7 +496,7 @@ Was there a better way to do all this to begin with?
 | date_run_ymd | job_id | success | time_taken_h:m | walltime_reqested_h | param_notes | git_head |
 |---|---|---|---|---|---|---|
 | 20260224 | 2532399 | TRUE | 4.6 | 24 | Saving yr > 260 | 1e3d9e8 |
-| 20260224 | 2532378 | TRUE | 4.57 | 24 | Saving yr > 260 | 1e3d9e8 |
+| 20260224 | 2532378 | TRUE | 4.57 | 24 | Saving yr > 260 | 1e4e7d9 |
 
 :::
 
