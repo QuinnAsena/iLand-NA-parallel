@@ -1,0 +1,230 @@
+From ed77daff66ffd4f6e55830be9526705f4b7eb8ce Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 06:48:30 +1300
+Subject: [PATCH 2/3] Fix three thread-safety problems in multithreaded runs
+
+RandomGenerator: every thread incremented one global buffer index, so all
+threads drawing random numbers (above all in Saplings::establishment)
+waited for the same cache line. perf showed 54% of establishment's samples
+on that increment, about 36% of all CPU time in a 28-thread run. Now the
+first (main) thread reads the shared buffer exactly as before, so
+single-threaded runs draw the same sequence as upstream (outputs verified
+identical with a fixed seed), and every other thread has its own Mersenne
+Twister, seeded from the run's seed, the thread's slot and the buffer
+generation, with a small local buffer. Threads share no numbers and write
+no shared state.
+
+SeedDispersal: the debug counter _debug_ldd, written by every species
+thread for every long-distance-dispersal pixel, is only reported in the
+GUI; its increments are compiled out of the console build.
+
+DebugTimer: the constructor checked the global timing table without the
+lock and locked only to insert. When the per-species seed dispersal
+threads created their first timer at the same time (year 1), one thread
+could read the hash while another rehashed it: a segfault in
+QtPrivate::equalStrings in a pooled thread (seen once in ~45 runs). The
+lookup now happens under the lock as well.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01F4XU94RLz4kFVSs5LcJjTK
+---
+ src/core/seeddispersal.cpp    | 12 ++++++++--
+ src/tools/debugtimer.cpp      | 11 +++++----
+ src/tools/randomgenerator.cpp | 44 +++++++++++++++++++++++++++++++++++
+ src/tools/randomgenerator.h   | 40 +++++++++++++++++++++++++++----
+ 4 files changed, 95 insertions(+), 12 deletions(-)
+
+diff --git a/src/core/seeddispersal.cpp b/src/core/seeddispersal.cpp
+index 88399c3..f39875e 100644
+--- a/src/core/seeddispersal.cpp
++++ b/src/core/seeddispersal.cpp
+@@ -625,7 +625,15 @@ void SeedDispersal::clearSaplingMap()
+         mSaplingSourceMap.initialize(0.f);
+ }
+ 
++// Count of long-distance-dispersal pixels, only reported in the GUI's debug log. It is a
++// single global written by every species thread, so in the console build the increments
++// are compiled out: the threads otherwise queue for this one cache line.
+ static int _debug_ldd=0;
++#ifdef ILAND_GUI
++#define COUNT_LDD() (_debug_ldd++)
++#else
++#define COUNT_LDD() ((void)0)
++#endif
+ void SeedDispersal::execute()
+ {
+ #ifdef ILAND_GUI
+@@ -774,7 +782,7 @@ void SeedDispersal::distributeSeeds(Grid<float> *seed_map)
+                                        pt.y() + static_cast<int>(radius*sin(phi)));
+                             if (mSeedMap.isIndexValid(ldd)) {
+                                 float &val = mSeedMap.valueAtIndex(ldd);
+-                                _debug_ldd++;
++                                COUNT_LDD();
+                                 val += ldd_val;
+                             }
+                         }
+@@ -826,7 +834,7 @@ void SeedDispersal::distributeSeeds(Grid<float> *seed_map)
+ 
+                             if (mSeedMap.isIndexValid(torus_pos)) {
+                                 float &val = mSeedMap.valueAtIndex(torus_pos);
+-                                _debug_ldd++;
++                                COUNT_LDD();
+                                 val += ldd_val;
+                             }
+                         }
+diff --git a/src/tools/debugtimer.cpp b/src/tools/debugtimer.cpp
+index d7e40d1..82fa42d 100644
+--- a/src/tools/debugtimer.cpp
++++ b/src/tools/debugtimer.cpp
+@@ -93,11 +93,12 @@ DebugTimer::DebugTimer(const QString &caption, bool silent)
+     m_hideShort=true;
+     m_caption = caption;
+     if (!caption.isEmpty()) {
+-        if (!mTimingList.contains(caption)) {
+-            QMutexLocker locker(&timer_mutex);
+-            if (!mTimingList.contains(caption))
+-                mTimingList[caption]=0.;
+-        }
++        // look up and insert under the lock: an unlocked contains() can read the hash while
++        // another thread inserts (and rehashes) it, e.g. the per-species seed dispersal threads
++        // creating their first timer at the same time in year 1
++        QMutexLocker locker(&timer_mutex);
++        if (!mTimingList.contains(caption))
++            mTimingList[caption]=0.;
+     }
+     start();
+ 
+diff --git a/src/tools/randomgenerator.cpp b/src/tools/randomgenerator.cpp
+index 8fba158..42ccfd9 100644
+--- a/src/tools/randomgenerator.cpp
++++ b/src/tools/randomgenerator.cpp
+@@ -113,6 +113,49 @@ inline void RGenerators::seed(unsigned int oneSeed)
+ // static variables
+ unsigned int RandomGenerator::mBuffer[RANDOMGENERATORSIZE+5];
+ int RandomGenerator::mIndex = 0;
++thread_local int RandomGenerator::tIndex = 0;
++thread_local int RandomGenerator::tEpoch = -1;
++thread_local int RandomGenerator::tSlot = -1;
++thread_local int RandomGenerator::tLocalPos = RANDOMGENERATORLOCALSIZE;
++thread_local unsigned int RandomGenerator::tLocal[RANDOMGENERATORLOCALSIZE];
++alignas(64) std::atomic<int> RandomGenerator::mEpoch{0};
++std::atomic<int> RandomGenerator::mThreadSlots{0};
++static thread_local MTRand *tLocalGenerator = nullptr; // generator of a non-main thread (one per thread, kept for the thread's life)
++
++static inline unsigned long long splitmix64(unsigned long long x)
++{
++    x += 0x9E3779B97F4A7C15ULL;
++    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
++    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
++    return x ^ (x >> 31);
++}
++
++void RandomGenerator::startEpoch(int epoch)
++{
++    tEpoch = epoch;
++    if (tSlot < 0)
++        tSlot = mThreadSlots.fetch_add(1, std::memory_order_relaxed); // first thread: slot 0
++    if (tSlot == 0) {
++        tIndex = 0; // the main thread reads the shared buffer from the start, as upstream
++        return;
++    }
++    // a non-main thread: own Mersenne Twister, seeded from the run's seed (the seed of the
++    // next shared refill), the thread's slot and the generation
++    unsigned long long key = (static_cast<unsigned long long>(mBuffer[RANDOMGENERATORSIZE+4]) << 32)
++                             ^ (static_cast<unsigned long long>(tSlot) << 16) ^ static_cast<unsigned long long>(epoch);
++    if (!tLocalGenerator)
++        tLocalGenerator = new MTRand(static_cast<MTRand::uint32>(splitmix64(key)));
++    else
++        tLocalGenerator->seed(static_cast<MTRand::uint32>(splitmix64(key)));
++    tLocalPos = RANDOMGENERATORLOCALSIZE; // refill on the next draw
++}
++
++void RandomGenerator::refillLocal()
++{
++    for (int i = 0; i < RANDOMGENERATORLOCALSIZE; ++i)
++        tLocal[i] = tLocalGenerator->randInt();
++    tLocalPos = 0;
++}
+ int RandomGenerator::mRotationCount = RANDOMGENERATORROTATIONS + 1;
+ int RandomGenerator::mRefillCounter = 0;
+ RandomGenerator::ERandomGenerators RandomGenerator::mGeneratorType = RandomGenerator::ergFastRandom;
+@@ -133,6 +176,7 @@ void RandomGenerator::refill() {
+     mIndex = 0; // reset the index
+     mRotationCount=0;
+     mRefillCounter++;
++    mEpoch.fetch_add(1, std::memory_order_relaxed); // every thread restarts its stream
+     }
+ 
+     RGenerators gen;
+diff --git a/src/tools/randomgenerator.h b/src/tools/randomgenerator.h
+index 22173ea..6867468 100644
+--- a/src/tools/randomgenerator.h
++++ b/src/tools/randomgenerator.h
+@@ -22,9 +22,11 @@
+ #include <cstdlib>
+ #include <math.h>
+ #include <time.h>
++#include <atomic>
+ 
+ #define RANDOMGENERATORSIZE 2000000
+ #define RANDOMGENERATORROTATIONS 10
++#define RANDOMGENERATORLOCALSIZE 1024 // per-thread buffer of the non-main threads
+ // a new set of numbers is generated for every 5*500000 = 2.500.000 numbers
+ class RandomGenerator
+ {
+@@ -32,9 +34,9 @@ public:
+     enum ERandomGenerators { ergMersenneTwister, ergWellRNG512, ergXORShift96, ergFastRandom };
+     RandomGenerator() { seed(0); setGeneratorType(ergMersenneTwister); }
+     /// set the type of the random generator that should be used.
+-    static void setGeneratorType(const ERandomGenerators gen) { mGeneratorType = gen; mRotationCount=RANDOMGENERATORROTATIONS+1;mIndex=0;mRefillCounter=0; }
+-    static void debugState(int &rIndex, int &rGeneration, int &rRefillCount) { rIndex = mIndex; rGeneration = mRotationCount; rRefillCount = mRefillCounter; }
+-    static int debugNRandomNumbers() { return mIndex + RANDOMGENERATORSIZE*mRotationCount + (RANDOMGENERATORROTATIONS+1)*RANDOMGENERATORSIZE*mRefillCounter; }
++    static void setGeneratorType(const ERandomGenerators gen) { mGeneratorType = gen; mRotationCount=RANDOMGENERATORROTATIONS+1;mIndex=0;mRefillCounter=0; mEpoch.fetch_add(1, std::memory_order_relaxed); }
++    static void debugState(int &rIndex, int &rGeneration, int &rRefillCount) { rIndex = tIndex; rGeneration = mRotationCount; rRefillCount = mRefillCounter; }
++    static int debugNRandomNumbers() { return tIndex + RANDOMGENERATORSIZE*mRotationCount + (RANDOMGENERATORROTATIONS+1)*RANDOMGENERATORSIZE*mRefillCounter; }
+     /// call this function to check if we need to create new random numbers.
+     /// this function is not reentrant! (e.g. call every year in the model)
+     static void checkGenerator() { if (mRotationCount>RANDOMGENERATORROTATIONS) { refill();  } }
+@@ -51,9 +53,37 @@ public:
+     static inline double randNorm( const double mean, const double stddev );
+ 
+ private:
+-    static inline unsigned long next() { ++mIndex; if (mIndex>RANDOMGENERATORSIZE) { mRotationCount++; mIndex=0; checkGenerator(); }  return mBuffer[mIndex]; }
++    // Threads do not share an index any more. Upstream, every call from every thread wrote the
++    // same global index, and with many threads (e.g. in Saplings::establishment) the threads spent
++    // most of their time waiting for that one cache line.
++    // - The first thread that draws numbers (the main thread, during setup) reads the shared
++    //   buffer exactly as before, so single-threaded runs draw the same sequence as upstream.
++    // - Every other thread has its own Mersenne Twister, seeded from the run's seed, the
++    //   thread's slot and the buffer generation (mEpoch), and keeps a small local buffer.
++    //   No numbers are shared between threads, and no shared state is written.
++    // mEpoch changes whenever the shared buffer is refilled or reset (new seed).
++    static inline unsigned long next() {
++        const int epoch = mEpoch.load(std::memory_order_relaxed);
++        if (tEpoch != epoch) startEpoch(epoch);
++        if (tSlot != 0) {
++            if (tLocalPos >= RANDOMGENERATORLOCALSIZE) refillLocal();
++            return tLocal[tLocalPos++];
++        }
++        ++tIndex;
++        if (tIndex>RANDOMGENERATORSIZE) { mRotationCount++; tIndex=0; checkGenerator(); }
++        return mBuffer[tIndex];
++    }
++    static void startEpoch(int epoch); ///< (re)start the calling thread's stream for buffer generation 'epoch'
++    static void refillLocal(); ///< fill the calling thread's local buffer from its own generator
+     static unsigned int mBuffer[RANDOMGENERATORSIZE+5];
+-    static int mIndex;
++    static int mIndex; ///< kept for the refill bookkeeping; the main thread reads with tIndex
++    static thread_local int tIndex;
++    static thread_local int tEpoch;
++    static thread_local int tSlot;
++    static thread_local int tLocalPos;
++    static thread_local unsigned int tLocal[RANDOMGENERATORLOCALSIZE];
++    alignas(64) static std::atomic<int> mEpoch;
++    static std::atomic<int> mThreadSlots;
+     static int mRotationCount;
+     static int mRefillCounter;
+     static ERandomGenerators mGeneratorType;
+-- 
+2.43.0
+

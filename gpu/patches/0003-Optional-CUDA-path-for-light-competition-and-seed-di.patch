@@ -1,0 +1,1039 @@
+From 7afc40c0c233f3ec358a6deabf95fed717bf5816 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 06:48:30 +1300
+Subject: [PATCH 3/3] Optional CUDA path for light competition and seed
+ dispersal
+
+qmake CONFIG+=cuda builds ilandc with src/gpu/iland_gpu.cu (CUDA runtime
+linked statically). At runtime the GPU is used if a device is present,
+unless ILAND_GPU=0; on any CUDA error the model continues on the CPU.
+
+- Light (Model::applyPattern/readPattern, non-torus): the GPU initialises
+  the LIF grid, builds the height grid, applies all patterns (atomic
+  multiply) and computes each tree's raw light sum; the species-specific
+  LRI correction and resource-unit sums stay on the CPU (Tree::readLIF is
+  split into lightSum() and setLightResourceIndex()). The GPU completes the
+  height grid before applying patterns; the CPU code interleaves both per
+  resource unit. ILAND_GPU_VALIDATE=1 compares each year with the CPU:
+  light grid within 4e-7, raw LRI within 5e-7 relative, height grid
+  identical; the CPU's own interleaving changes LRI by up to 128%.
+- Seed dispersal (non-torus): kernel convolution, long distance dispersal
+  (Philox random numbers seeded from iLand's generator) and scaling on the
+  GPU; statistically equivalent to the CPU, not bit-identical.
+- Model keeps the GPU members in every build so plugins compiled without
+  ILAND_CUDA see the same class layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01F4XU94RLz4kFVSs5LcJjTK
+---
+ src/core/gpulight.cpp       | 187 ++++++++++++++++++
+ src/core/gpulight.h         |  51 +++++
+ src/core/model.cpp          |  48 +++++
+ src/core/model.h            |   8 +
+ src/core/seeddispersal.cpp  |  23 +++
+ src/core/stamp.h            |   1 +
+ src/core/tree.cpp           |  20 +-
+ src/core/tree.h             |   3 +
+ src/gpu/iland_gpu.cu        | 368 ++++++++++++++++++++++++++++++++++++
+ src/gpu/iland_gpu.h         |  81 ++++++++
+ src/ilandc/consoleshell.cpp |   3 +
+ src/ilandc/ilandc.pro       |  27 +++
+ 12 files changed, 814 insertions(+), 6 deletions(-)
+ create mode 100644 src/core/gpulight.cpp
+ create mode 100644 src/core/gpulight.h
+ create mode 100644 src/gpu/iland_gpu.cu
+ create mode 100644 src/gpu/iland_gpu.h
+
+diff --git a/src/core/gpulight.cpp b/src/core/gpulight.cpp
+new file mode 100644
+index 0000000..07f4169
+--- /dev/null
++++ b/src/core/gpulight.cpp
+@@ -0,0 +1,187 @@
++/********************************************************************************************
++**    iLand - an individual based forest landscape and disturbance model
++**    https://iland-model.org
++**    Copyright (C) 2009-  Werner Rammer, Rupert Seidl
++**
++**    This program is free software: you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation, either version 3 of the License, or
++**    (at your option) any later version.
++********************************************************************************************/
++#ifdef ILAND_CUDA
++#include "global.h"
++#include "gpulight.h"
++#include "model.h"
++#include "resourceunit.h"
++#include "stamp.h"
++#include "tree.h"
++
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++
++static bool validationRequested()
++{
++    const char *env = std::getenv("ILAND_GPU_VALIDATE");
++    return env && std::strcmp(env, "0") != 0;
++}
++
++/// index of a stamp in the GPU stamp table; stamps are registered the first time a tree uses them
++int GpuLight::stampIndex(const Stamp *stamp)
++{
++    auto it = mStampIndex.find(stamp);
++    if (it != mStampIndex.end())
++        return it->second;
++    ilandgpu::StampInfo info;
++    info.dataOffset = static_cast<int>(mStampData.size());
++    info.dataSize = stamp->dataSize();
++    info.offset = stamp->offset();
++    const float *data = stamp->data(0, 0);
++    mStampData.insert(mStampData.end(), data, data + stamp->dataSize() * stamp->dataSize());
++    int index = static_cast<int>(mStampInfo.size());
++    mStampInfo.push_back(info);
++    mStampIndex[stamp] = index;
++    mStampsChanged = true;
++    return index;
++}
++
++bool GpuLight::applyPattern(Model *model)
++{
++    const QList<ResourceUnit*> &rus = model->ruList();
++    int max_index = 0;
++    for (const ResourceUnit *ru : rus)
++        max_index = std::max(max_index, ru->index());
++    mRuStart.assign(max_index + 1, 0);
++    mRuCount.assign(max_index + 1, 0);
++    mTrees.clear();
++    mTreePtr.clear();
++
++    // collect the trees, resource unit by resource unit
++    for (ResourceUnit *ru : rus) {
++        mRuStart[ru->index()] = static_cast<int>(mTreePtr.size());
++        for (Tree &tree : ru->trees()) {
++            if (!tree.mStamp || !tree.mStamp->reader())
++                continue; // the CPU code skips such trees too
++            ilandgpu::TreeLight t;
++            t.x = tree.mPositionIndex.x();
++            t.y = tree.mPositionIndex.y();
++            t.height = tree.mHeight;
++            t.opacity = tree.mOpacity;
++            t.writer = stampIndex(tree.mStamp);
++            t.reader = stampIndex(tree.mStamp->reader());
++            mTrees.push_back(t);
++            mTreePtr.push_back(&tree);
++        }
++        mRuCount[ru->index()] = static_cast<int>(mTreePtr.size()) - mRuStart[ru->index()];
++    }
++
++    if (mStampsChanged) {
++        const Grid<float> *dist = Stamp::distanceGrid();
++        ilandgpu::lightSetStamps(mStampData.data(), static_cast<int>(mStampData.size()),
++                                 mStampInfo.data(), static_cast<int>(mStampInfo.size()),
++                                 dist->begin(), dist->sizeX(), dist->sizeY());
++        mStampsChanged = false;
++    }
++
++    FloatGrid *lif = model->grid();
++    HeightGrid *hg = model->heightGrid();
++    if (mPinned != lif->begin()) {
++        // page-lock the light grid once: the GPU copies it back every year
++        ilandgpu::pinHostMemory(lif->begin(), sizeof(float) * static_cast<size_t>(lif->count()));
++        mPinned = lif->begin();
++    }
++    mLriRaw.resize(mTrees.size());
++    const bool do_validate = validationRequested();
++    std::vector<HeightGridValue> height_reset;
++    if (do_validate)
++        height_reset.assign(hg->begin(), hg->end());
++    bool ok = ilandgpu::lightRun(mTrees.data(), static_cast<int>(mTrees.size()),
++                                 hg->begin(), hg->sizeX(), hg->sizeY(),
++                                 lif->begin(), lif->sizeX(), lif->sizeY(), cPxPerHeight,
++                                 mLriRaw.data());
++    if (ok && do_validate)
++        validate(model, height_reset);
++    return ok;
++}
++
++/** Check the GPU against the CPU for the current year (slow; for testing only):
++  * (a) CPU with the same order as the GPU: complete height grid, then all patterns;
++  * (b) CPU in the order of the upstream code: resource unit by resource unit (even, then odd
++  *     units, as ThreadRunner), height grid and patterns interleaved.
++  * Reports the differences of the light grid, height grid and raw light sums, then restores
++  * the GPU results so the simulation continues as without the check. */
++void GpuLight::validate(Model *model, const std::vector<HeightGridValue> &height_reset)
++{
++    FloatGrid *lif = model->grid();
++    HeightGrid *hg = model->heightGrid();
++    const std::vector<float> lif_gpu(lif->begin(), lif->end());
++    const std::vector<HeightGridValue> hg_gpu(hg->begin(), hg->end());
++
++    auto compare_lif = [&](const std::vector<float> &a, double &max_abs, double &mean_abs) {
++        max_abs = 0.; double sum = 0.;
++        for (size_t i = 0; i < a.size(); ++i) {
++            double d = std::fabs(static_cast<double>(a[i]) - (*lif)[static_cast<int>(i)]);
++            max_abs = std::max(max_abs, d); sum += d;
++        }
++        mean_abs = sum / std::max<size_t>(1, a.size());
++    };
++    auto compare_lri = [&](const std::vector<double> &a, double &max_rel) {
++        max_rel = 0.;
++        for (size_t i = 0; i < a.size(); ++i) {
++            double cpu = mTreePtr[i]->lightSum();
++            double d = std::fabs(a[i] - cpu) / std::max(1e-12, std::fabs(cpu));
++            max_rel = std::max(max_rel, d);
++        }
++    };
++
++    // (a) CPU, same order as the GPU
++    std::copy(height_reset.begin(), height_reset.end(), hg->begin());
++    model->initializeGrid();
++    for (Tree *t : mTreePtr) t->heightGrid();
++    for (Tree *t : mTreePtr) t->applyLIP();
++    int height_diff = 0, count_diff = 0;
++    for (int i = 0; i < hg->count(); ++i) {
++        if (hg->begin()[i].height != hg_gpu[i].height) ++height_diff;
++        if (hg->begin()[i].count() != hg_gpu[i].count() || hg->begin()[i].stemHeight() != hg_gpu[i].stemHeight()) ++count_diff;
++    }
++    double lif_max, lif_mean, lri_max;
++    compare_lif(lif_gpu, lif_max, lif_mean);
++    std::vector<double> lri_gpu(mLriRaw.begin(), mLriRaw.end());
++    compare_lri(lri_gpu, lri_max);
++    const std::vector<float> lif_cpu(lif->begin(), lif->end());
++    std::vector<double> lri_cpu(mTreePtr.size());
++    for (size_t i = 0; i < mTreePtr.size(); ++i) lri_cpu[i] = mTreePtr[i]->lightSum();
++
++    // (b) CPU, upstream order (interleaved by resource unit); compared with (a)
++    std::copy(height_reset.begin(), height_reset.end(), hg->begin());
++    model->initializeGrid();
++    const QList<ResourceUnit*> &rus = model->ruList();
++    for (int pass = 0; pass < 2; ++pass)
++        for (int r = pass; r < rus.size(); r += 2) {
++            int start = mRuStart[rus[r]->index()], n = mRuCount[rus[r]->index()];
++            for (int i = start; i < start + n; ++i) mTreePtr[i]->heightGrid();
++            for (int i = start; i < start + n; ++i) mTreePtr[i]->applyLIP();
++        }
++    double up_max, up_mean, up_lri;
++    compare_lif(lif_cpu, up_max, up_mean);
++    compare_lri(lri_cpu, up_lri);
++
++    // restore the GPU results
++    std::copy(lif_gpu.begin(), lif_gpu.end(), lif->begin());
++    std::copy(hg_gpu.begin(), hg_gpu.end(), hg->begin());
++    qWarning().noquote() << QString("GPU check: %1 trees | GPU vs CPU (same order): light grid max %2 mean %3, "
++                                    "raw LRI max rel %4, height cells differing %5 (count/stem %6) | "
++                                    "CPU upstream order vs CPU same order: light grid max %7 mean %8, raw LRI max rel %9")
++                            .arg(mTreePtr.size()).arg(lif_max, 0, 'g', 3).arg(lif_mean, 0, 'g', 3).arg(lri_max, 0, 'g', 3)
++                            .arg(height_diff).arg(count_diff)
++                            .arg(up_max, 0, 'g', 3).arg(up_mean, 0, 'g', 3).arg(up_lri, 0, 'g', 3);
++}
++
++void GpuLight::readPattern(ResourceUnit *ru) const
++{
++    int start = mRuStart[ru->index()], n = mRuCount[ru->index()];
++    for (int i = start; i < start + n; ++i)
++        mTreePtr[i]->setLightResourceIndex(mLriRaw[i]);
++}
++
++#endif // ILAND_CUDA
+diff --git a/src/core/gpulight.h b/src/core/gpulight.h
+new file mode 100644
+index 0000000..03a68a0
+--- /dev/null
++++ b/src/core/gpulight.h
+@@ -0,0 +1,51 @@
++/********************************************************************************************
++**    iLand - an individual based forest landscape and disturbance model
++**    https://iland-model.org
++**    Copyright (C) 2009-  Werner Rammer, Rupert Seidl
++**
++**    This program is free software: you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation, either version 3 of the License, or
++**    (at your option) any later version.
++********************************************************************************************/
++#ifndef GPULIGHT_H
++#define GPULIGHT_H
++#ifdef ILAND_CUDA
++
++#include <unordered_map>
++#include <vector>
++#include "../gpu/iland_gpu.h"
++
++class Model;
++class ResourceUnit;
++class Stamp;
++class Tree;
++
++/** Runs the light competition of a year on the GPU (see gpu/iland_gpu.h).
++  * applyPattern(): collects all trees, then the GPU initialises the light grid, builds
++  * the height grid, applies the light influence patterns and reads every tree's raw
++  * light sum; the light and height grids are copied back for the rest of the year.
++  * readPattern(ru): finishes each tree's LRI on the CPU (species-specific correction,
++  * addition to the resource unit), in parallel over resource units like the CPU path.
++  * Torus mode is not supported (Model falls back to the CPU). */
++class GpuLight
++{
++public:
++    bool applyPattern(Model *model); ///< false on a GPU error (the caller then uses the CPU)
++    void readPattern(ResourceUnit *ru) const;
++private:
++    int stampIndex(const Stamp *stamp);
++    void validate(Model *model, const std::vector<struct HeightGridValue> &height_reset); ///< ILAND_GPU_VALIDATE=1: compare with the CPU
++    std::unordered_map<const Stamp*, int> mStampIndex;
++    std::vector<float> mStampData;
++    std::vector<ilandgpu::StampInfo> mStampInfo;
++    bool mStampsChanged = false;
++    std::vector<ilandgpu::TreeLight> mTrees;
++    std::vector<Tree*> mTreePtr;
++    std::vector<float> mLriRaw;
++    std::vector<int> mRuStart, mRuCount; ///< slice of mTreePtr per resource unit (by RU index)
++    void *mPinned = nullptr;
++};
++
++#endif // ILAND_CUDA
++#endif // GPULIGHT_H
+diff --git a/src/core/model.cpp b/src/core/model.cpp
+index f231c28..079e0b9 100644
+--- a/src/core/model.cpp
++++ b/src/core/model.cpp
+@@ -58,6 +58,10 @@
+ 
+ #include "forestmanagementengine.h"
+ #include "biteengine.h"
++#ifdef ILAND_CUDA
++#include "gpulight.h"
++#include "../gpu/iland_gpu.h"
++#endif
+ 
+ #include <QtCore>
+ #include <QtXml>
+@@ -145,6 +149,9 @@ Model::Model()
+ Model::~Model()
+ {
+     clear();
++#ifdef ILAND_CUDA
++    delete mGpuLight;
++#endif
+     GlobalSettings::instance()->setModel(nullptr);
+ }
+ 
+@@ -1063,6 +1070,18 @@ static void nc_applyPattern(ResourceUnit *unit)
+ }
+ 
+ /// multithreaded running function for LIP value extraction
++#ifdef ILAND_CUDA
++/// GPU path of readPattern: species-specific LRI correction and resource unit sums on the CPU
++static void nc_readPatternGpu(ResourceUnit *unit)
++{
++    try {
++        GlobalSettings::instance()->model()->gpuLight()->readPattern(unit);
++    } catch (const IException &e) {
++        GlobalSettings::instance()->model()->threadExec().throwError(e.message());
++    }
++}
++#endif
++
+ static void nc_readPattern(ResourceUnit *unit)
+ {
+     QVector<Tree>::iterator tit;
+@@ -1149,6 +1168,27 @@ void Model::applyPattern()
+ {
+ 
+     DebugTimer t("applyPattern()");
++#ifdef ILAND_CUDA
++    // GPU path: the GPU initialises the light grid, builds the height grid and applies and
++    // reads the patterns (see gpulight.h); the CPU only resets the height grid.
++    mGpuLightActive = false;
++    if (!mGpuLightFailed && !settings().torusMode && ilandgpu::enabled()) {
++        for (HeightGridValue *h=mHeightGrid->begin();h!=mHeightGrid->end();++h) {
++            h->resetCount();
++            h->height = cSapHeight;
++            h->clearStemHeight();
++        }
++        if (!mGpuLight)
++            mGpuLight = new GpuLight();
++        if (mGpuLight->applyPattern(this)) {
++            mGpuLightActive = true;
++            GlobalSettings::instance()->systemStatistics()->tApplyPattern+=t.elapsed();
++            return;
++        }
++        qWarning() << "GPU light competition failed, continuing on the CPU:" << ilandgpu::lastError();
++        mGpuLightFailed = true;
++    }
++#endif
+     // intialize grids...
+     initializeGrid();
+ 
+@@ -1166,6 +1206,14 @@ void Model::applyPattern()
+ void Model::readPattern()
+ {
+     DebugTimer t("readPattern()");
++#ifdef ILAND_CUDA
++    if (mGpuLightActive) {
++        // the raw light sums came from the GPU in applyPattern(); finish them per resource unit
++        threadRunner.run(nc_readPatternGpu);
++        GlobalSettings::instance()->systemStatistics()->tReadPattern+=t.elapsed();
++        return;
++    }
++#endif
+     threadRunner.run(nc_readPattern);
+     GlobalSettings::instance()->systemStatistics()->tReadPattern+=t.elapsed();
+ 
+diff --git a/src/core/model.h b/src/core/model.h
+index 39ad324..d535cfd 100644
+--- a/src/core/model.h
++++ b/src/core/model.h
+@@ -197,6 +197,14 @@ private:
+     /// SVD States
+     /// collection of all realized SVD states in the model
+     SVDStates *mSVDStates;
++    // GPU light competition (only used in CUDA builds, see gpulight.h). Declared in every build,
++    // so the class layout is the same for code compiled with and without ILAND_CUDA (plugins).
++    class GpuLight *mGpuLight = nullptr; ///< created on first use
++    bool mGpuLightFailed = false; ///< set after a GPU error: the CPU is used from then on
++    bool mGpuLightActive = false; ///< true if this year's applyPattern() ran on the GPU
++public:
++    class GpuLight *gpuLight() const { return mGpuLight; }
++    friend class GpuLight; // uses initializeGrid() to check the GPU against the CPU
+ };
+ 
+ class Tree;
+diff --git a/src/core/seeddispersal.cpp b/src/core/seeddispersal.cpp
+index f39875e..e6db83b 100644
+--- a/src/core/seeddispersal.cpp
++++ b/src/core/seeddispersal.cpp
+@@ -26,6 +26,12 @@
+ #include "species.h"
+ #include "tree.h"
+ #include "resourceunit.h"
++#ifdef ILAND_CUDA
++#include "../gpu/iland_gpu.h"
++#include <atomic>
++#include <vector>
++static std::atomic<bool> gpu_seed_failed{false}; // set after a GPU error: the CPU is used from then on
++#endif
+ #ifdef ILAND_GUI
+ #include <QtGui/QImage>
+ #endif
+@@ -751,6 +757,23 @@ void SeedDispersal::distributeSeeds(Grid<float> *seed_map)
+     // source mode
+ 
+     // *** seed distribution (Kernel + long distance dispersal) ***
++#ifdef ILAND_CUDA
++    // GPU path (non-torus): kernel convolution, long distance dispersal and the final scaling on
++    // the GPU. LDD uses the GPU's random numbers (seeded from iLand's generator), so the result
++    // is statistically equivalent to the CPU path, not identical.
++    if (!GlobalSettings::instance()->model()->settings().torusMode && !gpu_seed_failed && ilandgpu::enabled()) {
++        int n_rings = (!serotiny && !mLDDDensity.isEmpty()) ? mLDDDensity.size() : 0;
++        std::vector<float> density(mLDDDensity.begin(), mLDDDensity.end());
++        std::vector<float> distance(mLDDDistance.begin(), mLDDDistance.end());
++        uint64_t seed = (static_cast<uint64_t>(RandomGenerator::randInt()) << 32) | RandomGenerator::randInt();
++        if (ilandgpu::seedDispersal(sourcemap.begin(), mSeedMap.begin(), mSeedMap.sizeX(), mSeedMap.sizeY(),
++                                    mSeedMap.cellsize(), kernel.begin(), kernel.sizeX(), kernel.sizeY(), fec,
++                                    density.data(), distance.data(), n_rings, mLDDSeedlings / fec, seed))
++            return;
++        qWarning() << "GPU seed dispersal failed, continuing on the CPU:" << ilandgpu::lastError();
++        gpu_seed_failed = true;
++    }
++#endif
+     if (GlobalSettings::instance()->model()->settings().torusMode==false) {
+         // ** standard case (no torus) **
+         for (float *src=sourcemap.begin(); src!=sourcemap.end(); ++src) {
+diff --git a/src/core/stamp.h b/src/core/stamp.h
+index bec74be..3ed6a84 100644
+--- a/src/core/stamp.h
++++ b/src/core/stamp.h
+@@ -39,6 +39,7 @@ public:
+     Stamp(const int size):m_data(NULL) { setup(size); }
+     void setOffset(const int offset) { m_offset = offset; }
+     static void setDistanceGrid(const Grid<float> *grid) { mDistanceGrid = grid; }
++    static const Grid<float> *distanceGrid() { return mDistanceGrid; } ///< used by the GPU light kernels
+     int offset() const { return m_offset; } ///< delta between edge of the stamp and the logical center point (of the tree). e.g. a 5x5 stamp in an 8x8-grid has an offset from 2.
+     int count() const { return m_size*m_size; } ///< count of pixels (rectangle)
+     int size() const { return m_offset*2+1; } ///< logical size of the stamp
+diff --git a/src/core/tree.cpp b/src/core/tree.cpp
+index 3c182c3..0b3c6ce 100644
+--- a/src/core/tree.cpp
++++ b/src/core/tree.cpp
+@@ -463,11 +463,15 @@ void Tree::heightGrid_torus()
+   */
+ void Tree::readLIF()
+ {
+-    if (!mStamp)
++    if (!mStamp || !mStamp->reader())
+         return;
++    setLightResourceIndex(lightSum());
++}
++
++/// the light sum of readLIF() before any correction (no side effects); also used to check the GPU
++double Tree::lightSum() const
++{
+     const Stamp *reader = mStamp->reader();
+-    if (!reader)
+-        return;
+     QPoint pos_reader = mPositionIndex;
+     const float outside_area_factor = 0.1f; //
+ 
+@@ -509,7 +513,13 @@ void Tree::readLIF()
+ 
+         }
+     }
+-    mLRI = static_cast<float>( sum );
++    return sum;
++}
++
++/// the end of readLIF(): also used by the GPU path, which computes the raw sum on the GPU
++void Tree::setLightResourceIndex(const double raw_sum)
++{
++    mLRI = static_cast<float>( raw_sum );
+     // LRI correction...
+     double hrel = mHeight / mHeightGrid->valueAtIndex(mPositionIndex.x()/cPxPerHeight, mPositionIndex.y()/cPxPerHeight).height;
+     if (hrel<1.)
+@@ -521,8 +531,6 @@ void Tree::readLIF()
+ 
+     // Finally, add LRI of this Tree to the ResourceUnit!
+     mRU->addWLA(mLeafArea, mLRI);
+-
+-    //qDebug() << "Tree #"<< id() << "value" << sum << "Impact" << mImpact;
+ }
+ 
+ /// Torus version of read stamp (glued edges)
+diff --git a/src/core/tree.h b/src/core/tree.h
+index 2945427..3f4b8d2 100644
+--- a/src/core/tree.h
++++ b/src/core/tree.h
+@@ -145,6 +145,8 @@ public:
+     // grid based light-concurrency functions
+     void applyLIP(); ///< apply LightInfluencePattern onto the global grid
+     void readLIF(); ///< calculate the lightResourceIndex with multiplicative approach
++    double lightSum() const; ///< raw light sum of readLIF() (no side effects)
++    void setLightResourceIndex(const double raw_sum); ///< LRI from the raw sum of readLIF() (or the GPU): relative height correction, cap at 1, add to the resource unit
+     void heightGrid(); ///< calculate the height grid
+ 
+     void applyLIP_torus(); ///< apply LightInfluencePattern on a closed 1ha area
+@@ -249,6 +251,7 @@ private:
+ 
+     // friends
+     friend class TreeWrapper;
++    friend class GpuLight;
+     friend class StandStatistics;
+     friend class TreeOut;
+     friend class TreeRemovedOut;
+diff --git a/src/gpu/iland_gpu.cu b/src/gpu/iland_gpu.cu
+new file mode 100644
+index 0000000..9edcfce
+--- /dev/null
++++ b/src/gpu/iland_gpu.cu
+@@ -0,0 +1,368 @@
++/********************************************************************************************
++**    iLand - an individual based forest landscape and disturbance model
++**    https://iland-model.org
++**    Copyright (C) 2009-  Werner Rammer, Rupert Seidl
++**
++**    This program is free software: you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation, either version 3 of the License, or
++**    (at your option) any later version.
++********************************************************************************************/
++/** CUDA kernels for iLand's light competition and seed dispersal. See iland_gpu.h.
++  *
++  * Compiled with --fmad=false so that float expressions are rounded like the CPU code
++  * (no fused multiply-add). Results still differ from the CPU in the last bits where
++  * sums or products are formed in a different order (atomics, parallel reductions),
++  * and the light grid uses a complete height grid for every tree (the multithreaded CPU
++  * code builds the height grid resource unit by resource unit, interleaved with
++  * applying the patterns). Long distance seed dispersal uses the GPU's own random
++  * numbers, so GPU runs are statistically equivalent to CPU runs, not bit-identical.
++  */
++#include "iland_gpu.h"
++
++#include <cuda_runtime.h>
++#include <curand_kernel.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++
++namespace ilandgpu {
++
++// ------------------------------------------------------------------ state and helpers
++namespace {
++std::mutex gMutex;           // serialises GPU use (seed dispersal runs one thread per species)
++int gState = -1;             // -1: not checked, 0: disabled, 1: enabled
++std::string gDescription;
++char gLastError[512] = "";
++
++// persistent device buffers, grown as needed
++struct DeviceBuffer {
++    void *ptr = nullptr; size_t bytes = 0;
++    bool reserve(size_t n) {
++        if (n <= bytes) return true;
++        if (ptr) cudaFree(ptr);
++        ptr = nullptr; bytes = 0;
++        if (cudaMalloc(&ptr, n) != cudaSuccess) return false;
++        bytes = n; return true;
++    }
++};
++DeviceBuffer dStampData, dStampInfo, dDistance, dTrees, dHeight, dStemMax, dLif, dLri;
++DeviceBuffer dSource, dSeed, dKernel, dLdd;
++int gDistanceX = 0, gDistanceY = 0;
++cudaStream_t gStream = nullptr;
++
++bool check(cudaError_t err, const char *what) {
++    if (err == cudaSuccess) return true;
++    snprintf(gLastError, sizeof(gLastError), "%s: %s", what, cudaGetErrorString(err));
++    return false;
++}
++#define CHECK(call) do { if (!check((call), #call)) return false; } while (0)
++
++// atomics for non-negative floats: the int ordering of IEEE floats >= 0 is the float ordering
++__device__ inline void atomicMaxPositive(float *addr, float value) {
++    atomicMax(reinterpret_cast<int *>(addr), __float_as_int(value));
++}
++__device__ inline void atomicMinPositive(float *addr, float value) {
++    atomicMin(reinterpret_cast<int *>(addr), __float_as_int(value));
++}
++// multiplicative update (light influence patterns multiply into the grid)
++__device__ inline void atomicMultiply(float *addr, float factor) {
++    int *iaddr = reinterpret_cast<int *>(addr);
++    int old = *iaddr, assumed;
++    do {
++        assumed = old;
++        old = atomicCAS(iaddr, assumed, __float_as_int(__int_as_float(assumed) * factor));
++    } while (assumed != old);
++}
++
++struct HGV { float height; unsigned int count; };   // layout of HeightGridValue (8 bytes)
++static_assert(sizeof(HGV) == 8, "HeightGridValue layout");
++
++__device__ inline bool hgValid(const HGV &v) { return !((v.count >> 16) & 1u); }
++__device__ inline bool hgForestOutside(const HGV &v) { return (v.count >> 17) & 1u; }
++__device__ inline bool hgRadiating(const HGV &v) { return (v.count >> 18) & 1u; }
++
++// ------------------------------------------------------------------ light kernels
++__global__ void kFill(float *grid, size_t n, float value) {
++    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
++    if (i < n) grid[i] = value;
++}
++
++// Model::initializeGrid(): pixels around "radiating" height cells get a reduced start value
++__global__ void kRadiate(float *lif, int sx, int sy, const HGV *hg, int hx, int hy, int pxh) {
++    int cell = blockIdx.x * blockDim.x + threadIdx.x;
++    if (cell >= hx * hy || !hgRadiating(hg[cell])) return;
++    const int max_dist = 7, px_offset = pxh / 2;
++    const float step = 1.f / static_cast<float>(max_dist);
++    int px = cell % hx, py = cell / hx;
++    int ix_min = px * pxh - max_dist + px_offset, iy_min = py * pxh - max_dist + px_offset;
++    int ix_c = ix_min + max_dist, iy_c = iy_min + max_dist;
++    for (int y = iy_min; y <= iy_min + 2 * max_dist + 1; ++y)
++        for (int x = ix_min; x <= ix_min + 2 * max_dist + 1; ++x) {
++            if (x < 0 || y < 0 || x >= sx || y >= sy) continue;
++            if (!hgValid(hg[(y / pxh) * hx + x / pxh])) continue;
++            float value = max(abs(x - ix_c), abs(y - iy_c)) * step;
++            if (value >= 0.f) atomicMinPositive(&lif[(size_t)y * sx + x], value);
++        }
++}
++
++// Tree::heightGrid()
++__global__ void kHeight(const TreeLight *trees, int n, const StampInfo *stamps, HGV *hg, float *stem_max,
++                        int hx, int hy, int pxh) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    TreeLight t = trees[i];
++    int px = t.x / pxh, py = t.y / pxh;
++    int cell = py * hx + px;
++    atomicAdd(&hg[cell].count, 1u);
++    atomicMaxPositive(&hg[cell].height, t.height);
++    atomicMaxPositive(&stem_max[cell], t.height);
++    int r = stamps[t.reader].offset;
++    int iew = t.x % pxh, ins = t.y % pxh;
++    if (iew - r < 0 && px > 0) atomicMaxPositive(&hg[cell - 1].height, t.height);
++    if (iew + r >= pxh && px + 1 < hx) atomicMaxPositive(&hg[cell + 1].height, t.height);
++    if (ins - r < 0 && py > 0) atomicMaxPositive(&hg[cell - hx].height, t.height);
++    if (ins + r >= pxh && py + 1 < hy) atomicMaxPositive(&hg[cell + hx].height, t.height);
++}
++
++// stem height: the CPU keeps round(max height of trees on the cell) in bits 20-27
++__global__ void kStemHeight(HGV *hg, const float *stem_max, int n) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n || !(stem_max[i] > 0.f)) return;
++    unsigned int hval = static_cast<unsigned int>(stem_max[i] + 0.5f);
++    hg[i].count = (hg[i].count & 0xF00FFFFFu) | (hval << 20);
++}
++
++// Tree::applyLIP(): one block per tree, threads loop over the stamp's pixels
++__global__ void kApply(const TreeLight *trees, int n, const StampInfo *stamps, const float *sdata,
++                       const float *dist, int dx, const HGV *hg, int hx, float *lif, int sx, int sy, int pxh) {
++    int i = blockIdx.x;
++    if (i >= n) return;
++    TreeLight t = trees[i];
++    StampInfo w = stamps[t.writer];
++    int size = 2 * w.offset + 1;
++    int x0 = t.x - w.offset, y0 = t.y - w.offset;
++    if (x0 < 0 || y0 < 0 || x0 >= sx || y0 >= sy || x0 + size < 0 || y0 + size < 0 || x0 + size >= sx || y0 + size >= sy)
++        return; // as on the CPU: should not happen because of the buffer
++    for (int k = threadIdx.x; k < size * size; k += blockDim.x) {
++        int x = k % size, y = k / size;
++        int gx = x0 + x, gy = y0 + y;
++        float value = sdata[w.dataOffset + y * w.dataSize + x];
++        float local_dom = hg[(gy / pxh) * hx + gx / pxh].height;
++        float z = fmaxf(t.height - dist[abs(y - w.offset) * dx + abs(x - w.offset)], 0.f);
++        float z_zstar = (z >= local_dom) ? 1.f : z / local_dom;
++        value = 1.f - value * t.opacity * z_zstar;
++        value = fmaxf(value, 0.02f);
++        atomicMultiply(&lif[(size_t)gy * sx + gx], value);
++    }
++}
++
++// Tree::readLIF() up to the raw sum: one block per tree, double-precision block reduction
++__global__ void kRead(const TreeLight *trees, int n, const StampInfo *stamps, const float *sdata,
++                      const float *dist, int dx, const HGV *hg, int hx, const float *lif, int sx, int sy,
++                      int pxh, float *lri_raw) {
++    __shared__ double partial[128];
++    int i = blockIdx.x;
++    if (i >= n) return;
++    TreeLight t = trees[i];
++    StampInfo w = stamps[t.writer], r = stamps[t.reader];
++    int rsize = 2 * r.offset + 1;
++    int d_offset = w.offset - r.offset;
++    int rx = t.x - r.offset, ry = t.y - r.offset;
++    double sum = 0.;
++    for (int k = threadIdx.x; k < rsize * rsize; k += blockDim.x) {
++        int x = k % rsize, y = k / rsize;
++        int gx = rx + x, gy = ry + y;
++        if (gx < 0 || gy < 0 || gx >= sx || gy >= sy) continue;
++        HGV hgv = hg[(gy / pxh) * hx + gx / pxh];
++        float local_dom = hgv.height;
++        float z = fmaxf(t.height - dist[abs(y - r.offset) * dx + abs(x - r.offset)], 0.f);
++        float z_zstar = (z >= local_dom) ? 1.f : z / local_dom;
++        float prod = sdata[w.dataOffset + (y + d_offset) * w.dataSize + (x + d_offset)] * t.opacity * z_zstar;
++        double own_value = 1. - prod;
++        own_value = own_value > 0.02 ? own_value : 0.02;
++        double value = lif[(size_t)gy * sx + gx] / own_value;
++        if (hgForestOutside(hgv)) value *= 0.1f;
++        sum += value * sdata[r.dataOffset + y * r.dataSize + x];
++    }
++    partial[threadIdx.x] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) lri_raw[i] = static_cast<float>(partial[0]);
++}
++
++// ------------------------------------------------------------------ seed kernels
++// seed_map[t] += sum over kernel of source * kernel (the CPU scatters from sources; this gathers)
++__global__ void kSeedConvolve(const float *src, float *seed, int sx, int sy, const float *kernel, int kx, int ky) {
++    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= sx || y >= sy) return;
++    int offset = kx / 2;   // as SeedDispersal: offset = kernel.sizeX()/2 in both directions
++    float acc = 0.f;
++    for (int iy = 0; iy < ky; ++iy) {
++        int syy = y + offset - iy;
++        if (syy < 0 || syy >= sy) continue;
++        for (int ix = 0; ix < kx; ++ix) {
++            int sxx = x + offset - ix;
++            if (sxx < 0 || sxx >= sx) continue;
++            float s = src[syy * sx + sxx];
++            if (s > 0.f) acc += s * kernel[iy * kx + ix];
++        }
++    }
++    seed[y * sx + x] += acc;
++}
++
++// long distance dispersal: from every source pixel > 0, as in SeedDispersal::distributeSeeds()
++__global__ void kSeedLDD(const float *src, float *seed, int sx, int sy, float cellsize, const float *density,
++                         const float *distance, int n_rings, float ldd_value, unsigned long long rng_seed) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= sx * sy || !(src[i] > 0.f)) return;
++    curandStatePhilox4_32_10_t st;
++    curand_init(rng_seed, i, 0, &st);
++    int px = i % sx, py = i / sx;
++    for (int r = 0; r < n_rings; ++r) {
++        int nld = density[r] < 1.f ? (curand_uniform(&st) < density[r] ? 1 : 0) : static_cast<int>(roundf(density[r]));
++        for (int k = 0; k < nld; ++k) {
++            float radius = (distance[r] + (distance[r + 1] - distance[r]) * curand_uniform(&st)) / cellsize;
++            float phi = curand_uniform(&st) * 2.f * 3.14159265358979f;
++            float sn, cs;
++            sincosf(phi, &sn, &cs);
++            int lx = px + static_cast<int>(radius * cs), ly = py + static_cast<int>(radius * sn);
++            if (lx >= 0 && ly >= 0 && lx < sx && ly < sy) atomicAdd(&seed[ly * sx + lx], ldd_value);
++        }
++    }
++}
++
++__global__ void kSeedFinish(float *seed, int n, float fec) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n && seed[i] > 0.f) seed[i] = fminf(seed[i] * fec / 100.f, 1.f);
++}
++
++inline int blocks(size_t n, int threads) { return static_cast<int>((n + threads - 1) / threads); }
++} // anonymous namespace
++
++// ------------------------------------------------------------------ public API
++bool enabled() {
++    std::lock_guard<std::mutex> lock(gMutex);
++    if (gState >= 0) return gState == 1;
++    const char *env = std::getenv("ILAND_GPU");
++    if (env && std::strcmp(env, "0") == 0) {
++        gState = 0; gDescription = "GPU disabled (ILAND_GPU=0)"; return false;
++    }
++    int n = 0;
++    if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
++        gState = 0; gDescription = "no CUDA device found: running on the CPU"; return false;
++    }
++    cudaDeviceProp prop;
++    cudaGetDeviceProperties(&prop, 0);
++    cudaSetDevice(0);
++    cudaStreamCreateWithFlags(&gStream, cudaStreamNonBlocking);
++    gDescription = std::string("GPU: ") + prop.name + " (light competition and seed dispersal on the GPU)";
++    gState = 1;
++    return true;
++}
++
++std::string description() { enabled(); return gDescription; }
++const char *lastError() { return gLastError; }
++
++void pinHostMemory(void *ptr, size_t bytes) {
++    if (cudaHostRegister(ptr, bytes, cudaHostRegisterDefault) != cudaSuccess)
++        cudaGetLastError(); // not fatal: transfers just stay pageable
++}
++
++void lightSetStamps(const float *data, int n_floats, const StampInfo *stamps, int n_stamps,
++                    const float *distance_grid, int distance_size_x, int distance_size_y) {
++    std::lock_guard<std::mutex> lock(gMutex);
++    if (dStampData.reserve(n_floats * sizeof(float)))
++        cudaMemcpy(dStampData.ptr, data, n_floats * sizeof(float), cudaMemcpyHostToDevice);
++    if (dStampInfo.reserve(n_stamps * sizeof(StampInfo)))
++        cudaMemcpy(dStampInfo.ptr, stamps, n_stamps * sizeof(StampInfo), cudaMemcpyHostToDevice);
++    size_t nd = (size_t)distance_size_x * distance_size_y;
++    if (dDistance.reserve(nd * sizeof(float)))
++        cudaMemcpy(dDistance.ptr, distance_grid, nd * sizeof(float), cudaMemcpyHostToDevice);
++    gDistanceX = distance_size_x; gDistanceY = distance_size_y;
++}
++
++bool lightRun(const TreeLight *trees, int n_trees, void *height_grid, int h_size_x, int h_size_y,
++              float *lif_grid, int size_x, int size_y, int px_per_height, float *lri_raw) {
++    std::lock_guard<std::mutex> lock(gMutex);
++    size_t n_lif = (size_t)size_x * size_y, n_h = (size_t)h_size_x * h_size_y;
++    if (!dTrees.reserve(std::max(1, n_trees) * sizeof(TreeLight)) || !dHeight.reserve(n_h * sizeof(HGV)) ||
++        !dStemMax.reserve(n_h * sizeof(float)) || !dLif.reserve(n_lif * sizeof(float)) ||
++        !dLri.reserve(std::max(1, n_trees) * sizeof(float))) {
++        snprintf(gLastError, sizeof(gLastError), "out of GPU memory");
++        return false;
++    }
++    auto *d_trees = static_cast<TreeLight *>(dTrees.ptr);
++    auto *d_hg = static_cast<HGV *>(dHeight.ptr);
++    auto *d_stem = static_cast<float *>(dStemMax.ptr);
++    auto *d_lif = static_cast<float *>(dLif.ptr);
++    auto *d_lri = static_cast<float *>(dLri.ptr);
++    auto *d_stamps = static_cast<const StampInfo *>(dStampInfo.ptr);
++    auto *d_sdata = static_cast<const float *>(dStampData.ptr);
++    auto *d_dist = static_cast<const float *>(dDistance.ptr);
++    cudaStream_t s = gStream;
++
++    CHECK(cudaMemcpyAsync(d_trees, trees, n_trees * sizeof(TreeLight), cudaMemcpyHostToDevice, s));
++    CHECK(cudaMemcpyAsync(d_hg, height_grid, n_h * sizeof(HGV), cudaMemcpyHostToDevice, s));
++    CHECK(cudaMemsetAsync(d_stem, 0, n_h * sizeof(float), s));
++    kFill<<<blocks(n_lif, 256), 256, 0, s>>>(d_lif, n_lif, 1.f);
++    kRadiate<<<blocks(n_h, 128), 128, 0, s>>>(d_lif, size_x, size_y, d_hg, h_size_x, h_size_y, px_per_height);
++    if (n_trees > 0) {
++        kHeight<<<blocks(n_trees, 256), 256, 0, s>>>(d_trees, n_trees, d_stamps, d_hg, d_stem, h_size_x, h_size_y, px_per_height);
++        kStemHeight<<<blocks(n_h, 256), 256, 0, s>>>(d_hg, d_stem, static_cast<int>(n_h));
++        kApply<<<n_trees, 128, 0, s>>>(d_trees, n_trees, d_stamps, d_sdata, d_dist, gDistanceX, d_hg, h_size_x,
++                                        d_lif, size_x, size_y, px_per_height);
++        kRead<<<n_trees, 128, 0, s>>>(d_trees, n_trees, d_stamps, d_sdata, d_dist, gDistanceX, d_hg, h_size_x,
++                                       d_lif, size_x, size_y, px_per_height, d_lri);
++    }
++    CHECK(cudaGetLastError());
++    CHECK(cudaMemcpyAsync(lif_grid, d_lif, n_lif * sizeof(float), cudaMemcpyDeviceToHost, s));
++    CHECK(cudaMemcpyAsync(height_grid, d_hg, n_h * sizeof(HGV), cudaMemcpyDeviceToHost, s));
++    if (n_trees > 0)
++        CHECK(cudaMemcpyAsync(lri_raw, d_lri, n_trees * sizeof(float), cudaMemcpyDeviceToHost, s));
++    CHECK(cudaStreamSynchronize(s));
++    return true;
++}
++
++bool seedDispersal(const float *source, float *seed_map, int size_x, int size_y, float cellsize,
++                   const float *kernel, int kernel_size_x, int kernel_size_y,
++                   float fec, const float *ldd_density, const float *ldd_distance, int n_rings,
++                   float ldd_value, uint64_t seed) {
++    std::lock_guard<std::mutex> lock(gMutex);
++    size_t n = (size_t)size_x * size_y, nk = (size_t)kernel_size_x * kernel_size_y;
++    if (!dSource.reserve(n * sizeof(float)) || !dSeed.reserve(n * sizeof(float)) ||
++        !dKernel.reserve(nk * sizeof(float)) || !dLdd.reserve((2 * n_rings + 2) * sizeof(float))) {
++        snprintf(gLastError, sizeof(gLastError), "out of GPU memory");
++        return false;
++    }
++    auto *d_src = static_cast<float *>(dSource.ptr);
++    auto *d_seed = static_cast<float *>(dSeed.ptr);
++    auto *d_kernel = static_cast<float *>(dKernel.ptr);
++    auto *d_ldd = static_cast<float *>(dLdd.ptr);
++    cudaStream_t s = gStream;
++    CHECK(cudaMemcpyAsync(d_src, source, n * sizeof(float), cudaMemcpyHostToDevice, s));
++    CHECK(cudaMemcpyAsync(d_seed, seed_map, n * sizeof(float), cudaMemcpyHostToDevice, s));
++    CHECK(cudaMemcpyAsync(d_kernel, kernel, nk * sizeof(float), cudaMemcpyHostToDevice, s));
++    if (n_rings > 0) {
++        CHECK(cudaMemcpyAsync(d_ldd, ldd_density, n_rings * sizeof(float), cudaMemcpyHostToDevice, s));
++        CHECK(cudaMemcpyAsync(d_ldd + n_rings, ldd_distance, (n_rings + 1) * sizeof(float), cudaMemcpyHostToDevice, s));
++    }
++    dim3 tb(16, 16), grid(blocks(size_x, 16), blocks(size_y, 16));
++    kSeedConvolve<<<grid, tb, 0, s>>>(d_src, d_seed, size_x, size_y, d_kernel, kernel_size_x, kernel_size_y);
++    if (n_rings > 0)
++        kSeedLDD<<<blocks(n, 128), 128, 0, s>>>(d_src, d_seed, size_x, size_y, cellsize, d_ldd, d_ldd + n_rings,
++                                                 n_rings, ldd_value, seed);
++    kSeedFinish<<<blocks(n, 256), 256, 0, s>>>(d_seed, static_cast<int>(n), fec);
++    CHECK(cudaGetLastError());
++    CHECK(cudaMemcpyAsync(seed_map, d_seed, n * sizeof(float), cudaMemcpyDeviceToHost, s));
++    CHECK(cudaStreamSynchronize(s));
++    return true;
++}
++
++} // namespace ilandgpu
+diff --git a/src/gpu/iland_gpu.h b/src/gpu/iland_gpu.h
+new file mode 100644
+index 0000000..e4a596f
+--- /dev/null
++++ b/src/gpu/iland_gpu.h
+@@ -0,0 +1,81 @@
++/********************************************************************************************
++**    iLand - an individual based forest landscape and disturbance model
++**    https://iland-model.org
++**    Copyright (C) 2009-  Werner Rammer, Rupert Seidl
++**
++**    This program is free software: you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation, either version 3 of the License, or
++**    (at your option) any later version.
++********************************************************************************************/
++/** GPU (CUDA) kernels for the two most data-parallel parts of an iLand year:
++  * the light competition (height grid, applying and reading light influence
++  * patterns) and seed dispersal (kernel convolution plus long distance dispersal).
++  *
++  * This header is plain C++ (no Qt, no CUDA types), so the rest of iLand compiles
++  * with an ordinary C++ compiler; only iland_gpu.cu needs nvcc. Built only with
++  * qmake CONFIG+=cuda (which defines ILAND_CUDA). At runtime the GPU is used if a
++  * CUDA device is present, unless the environment variable ILAND_GPU=0.
++  */
++#ifndef ILAND_GPU_H
++#define ILAND_GPU_H
++
++#include <cstdint>
++#include <string>
++
++namespace ilandgpu {
++
++/// true if the GPU path is enabled (built with CUDA, a device is present, ILAND_GPU != 0)
++bool enabled();
++/// human readable description of the device (or why the GPU is not used)
++std::string description();
++
++// ------------------------------------------------------------------ light competition
++
++/// one entry per light influence pattern (stamp); data is stored row-major with
++/// 'dataSize' floats per row; 'offset' is the distance between edge and centre pixel.
++struct StampInfo { int dataOffset; int dataSize; int offset; };
++
++/// per-tree input for the light kernels (positions are indices on the 2m LIF grid)
++struct TreeLight { int x; int y; float height; float opacity; int writer; int reader; };
++
++/// upload all stamps (concatenated data) and the distance grid used by Stamp::distanceToCenter()
++void lightSetStamps(const float *data, int n_floats, const StampInfo *stamps, int n_stamps,
++                    const float *distance_grid, int distance_size_x, int distance_size_y);
++
++/** run the light competition for one year:
++  * 1. LIF grid := 1, plus the "radiating" border values (as Model::initializeGrid())
++  * 2. height grid: tree count, dominant height (incl. crowns spilling into neighbours), stem height
++  *    (as Tree::heightGrid())
++  * 3. apply the light influence patterns multiplicatively (as Tree::applyLIP())
++  * 4. read the light resource index of every tree (as Tree::readLIF(), before the
++  *    relative-height correction, which needs the species' expression and runs on the CPU)
++  * height_grid: the reset height grid (8 bytes per cell: float height + uint32 count/flags),
++  *              overwritten with the result. lif_grid: output (size_x*size_y floats).
++  * lri_raw: output, one value per tree. Returns false on a CUDA error (message in lastError()). */
++bool lightRun(const TreeLight *trees, int n_trees,
++              void *height_grid, int h_size_x, int h_size_y,
++              float *lif_grid, int size_x, int size_y, int px_per_height,
++              float *lri_raw);
++
++/// pin a host buffer for faster transfers (e.g. the LIF grid); harmless if it fails
++void pinHostMemory(void *ptr, size_t bytes);
++
++// ------------------------------------------------------------------ seed dispersal
++
++/** seed dispersal for one species and year (as SeedDispersal::distributeSeeds(), non-torus):
++  * seed_map += convolution(source, kernel); plus long distance dispersal (LDD) from every
++  * source pixel > 0 if n_rings > 0; then seed_map := min(seed_map * fec / 100, 1) where > 0.
++  * source: already normalised (min(p / cellsize^2 / 3, 1)). LDD uses the GPU's own
++  * counter-based random numbers (Philox), seeded with 'seed'.
++  * ldd_density: n_rings values, ldd_distance: n_rings+1 values (metres). */
++bool seedDispersal(const float *source, float *seed_map, int size_x, int size_y, float cellsize,
++                   const float *kernel, int kernel_size_x, int kernel_size_y,
++                   float fec, const float *ldd_density, const float *ldd_distance, int n_rings,
++                   float ldd_value, uint64_t seed);
++
++const char *lastError();
++
++} // namespace ilandgpu
++
++#endif // ILAND_GPU_H
+diff --git a/src/ilandc/consoleshell.cpp b/src/ilandc/consoleshell.cpp
+index 1273baa..2e12b6f 100644
+--- a/src/ilandc/consoleshell.cpp
++++ b/src/ilandc/consoleshell.cpp
+@@ -27,6 +27,9 @@
+ #include "model.h"
+ #include "modelcontroller.h"
+ #include "version.h"
++#ifdef ILAND_CUDA
++#include "../gpu/iland_gpu.h"
++#endif
+ 
+ QTextStream *ConsoleShell::mLogStream = 0;
+ bool ConsoleShell::mFlushLog = false;
+diff --git a/src/ilandc/ilandc.pro b/src/ilandc/ilandc.pro
+index 9647107..1189db5 100644
+--- a/src/ilandc/ilandc.pro
++++ b/src/ilandc/ilandc.pro
+@@ -449,6 +449,33 @@ HEADERS += \
+ 
+ RESOURCES += ../iland/res/iland.qrc
+ 
++# ===============================================================
++# Optional GPU (CUDA) build: qmake CONFIG+=cuda [CUDA_DIR=/usr/local/cuda] [CUDA_ARCH="-arch=sm_80"]
++# Runs the light competition and seed dispersal on an NVIDIA GPU (see ../gpu/iland_gpu.h).
++# The CUDA runtime is linked statically, so compute nodes only need the NVIDIA driver.
++# At runtime: the GPU is used if a device is present, unless ILAND_GPU=0.
++# ===============================================================
++cuda {
++    isEmpty(CUDA_DIR): CUDA_DIR = $$(CUDA_HOME)
++    isEmpty(CUDA_DIR): CUDA_DIR = /usr/local/cuda
++    # default: all major GPU generations; e.g. CUDA_ARCH="-arch=sm_80" for A100 only
++    isEmpty(CUDA_ARCH): CUDA_ARCH = -arch=all-major
++    DEFINES += ILAND_CUDA
++    SOURCES += ../core/gpulight.cpp
++    HEADERS += ../core/gpulight.h ../gpu/iland_gpu.h
++    CUDA_SOURCES = $$PWD/../gpu/iland_gpu.cu
++    cuda_compiler.input = CUDA_SOURCES
++    cuda_compiler.output = ${QMAKE_FILE_BASE}_cuda.o
++    # --fmad=false: no fused multiply-add, so float results round like the CPU code
++    cuda_compiler.commands = $$CUDA_DIR/bin/nvcc -O3 --fmad=false -std=c++17 $$CUDA_ARCH -Xcompiler -fPIC -c ${QMAKE_FILE_NAME} -o ${QMAKE_FILE_OUT}
++    cuda_compiler.dependency_type = TYPE_C
++    cuda_compiler.depends = $$PWD/../gpu/iland_gpu.h
++    cuda_compiler.variable_out = OBJECTS
++    QMAKE_EXTRA_COMPILERS += cuda_compiler
++    LIBS += -L$$CUDA_DIR/lib64 -lcudart_static -ldl -lrt -lpthread
++    message("CUDA build: $$CUDA_DIR $$CUDA_ARCH")
++}
++
+ 
+ 
+ 
+-- 
+2.43.0
+
